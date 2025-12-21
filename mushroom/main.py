@@ -16,6 +16,12 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
 
+import threading
+import time
+
+from fastapi.responses import StreamingResponse
+import cv2
+
 
 # ------------------------- env helpers -------------------------
 
@@ -84,6 +90,13 @@ class RuntimeState:
     # last error (shown in UI)
     last_error: Optional[str] = None
 
+    # ---- camera (RTSP -> MJPEG) ----
+    cam_rtsp_url: str = ""
+    cam_latest_jpeg: Optional[bytes] = None
+    cam_last_frame: Optional[datetime] = None
+    cam_running: bool = False
+
+
 
 # ------------------------- tapo helper -------------------------
 
@@ -97,10 +110,121 @@ async def _connect_device(client: ApiClient, model: str, ip: str):
     return await factory(ip)
 
 
+def start_camera_thread(state: RuntimeState, log: logging.Logger) -> None:
+    rtsp = _env_str("CAM_RTSP_URL", "")
+    if not rtsp:
+        log.info("Camera: CAM_RTSP_URL not set; camera disabled")
+        return
+
+    fps = _env_int("CAM_FPS", 5)
+    quality = _env_int("CAM_JPEG_QUALITY", 80)
+    max_w = _env_int("CAM_MAX_WIDTH", 960)
+
+    state.cam_rtsp_url = rtsp
+    state.cam_running = True
+
+    stop_evt = threading.Event()
+
+    def worker():
+        # Use TCP for RTSP if your network is flaky (optional):
+        # os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+        cap = None
+        last_ok = time.time()
+
+        while not stop_evt.is_set():
+            try:
+                if cap is None or not cap.isOpened():
+                    log.info("Camera: connecting to RTSP...")
+                    cap = cv2.VideoCapture(rtsp)
+                    # give it a moment
+                    time.sleep(0.3)
+
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    # reconnect if stalled
+                    if time.time() - last_ok > 5:
+                        log.warning("Camera: no frames, reconnecting...")
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        cap = None
+                    time.sleep(0.2)
+                    continue
+
+                last_ok = time.time()
+
+                # downscale (optional)
+                if max_w and frame.shape[1] > max_w:
+                    h, w = frame.shape[:2]
+                    new_h = int(h * (max_w / w))
+                    frame = cv2.resize(frame, (max_w, new_h))
+
+                # encode jpeg
+                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+                if ok:
+                    state.cam_latest_jpeg = buf.tobytes()
+                    state.cam_last_frame = datetime.now(timezone.utc)
+
+                # throttle capture rate a bit
+                time.sleep(max(0.0, 1.0 / max(1, fps)))
+
+            except Exception as e:
+                log.warning("Camera worker error: %s", e)
+                time.sleep(1.0)
+
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+        log.info("Camera: stopped")
+
+    t = threading.Thread(target=worker, daemon=True, name="camera_rtsp_worker")
+    t.start()
+
+    # attach stop handle to state (simple attribute)
+    state._cam_stop_evt = stop_evt  # type: ignore[attr-defined]
+
 # ------------------------- web app -------------------------
 
 def build_app(state: RuntimeState, logbuf: Deque[str]) -> FastAPI:
     app = FastAPI(title="Mushroom Monitor")
+    @app.get("/api/cam.jpg")
+    async def cam_jpg():
+        if not state.cam_latest_jpeg:
+            return PlainTextResponse("No frame yet", status_code=503)
+        return fastapi.responses.Response(content=state.cam_latest_jpeg, media_type="image/jpeg")
+
+
+    @app.get("/api/cam.mjpg")
+    async def cam_mjpg():
+        if not state.cam_rtsp_url:
+            return PlainTextResponse("Camera disabled (CAM_RTSP_URL not set)", status_code=404)
+
+        async def gen():
+            boundary = b"frame"
+            while True:
+                jpg = state.cam_latest_jpeg
+                if not jpg:
+                    await asyncio.sleep(0.2)
+                    continue
+
+                yield b"--" + boundary + b"\r\n"
+                yield b"Content-Type: image/jpeg\r\n"
+                yield f"Content-Length: {len(jpg)}\r\n\r\n".encode("ascii")
+                yield jpg
+                yield b"\r\n"
+
+                await asyncio.sleep(0.05)  # tiny pause for browser friendliness
+
+        return StreamingResponse(
+            gen(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-cache"},
+        )
+
 
     @app.get("/", response_class=HTMLResponse)
     async def home():
@@ -156,6 +280,12 @@ def build_app(state: RuntimeState, logbuf: Deque[str]) -> FastAPI:
       <div class="v" id="temp">—</div>
     </div>
   </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+        <div class="k">Camera</div>
+        <img src="/api/cam.mjpg" style="width:100%; border-radius: 12px; margin-top: 8px;" />
+    </div>
+
 
   <h3 style="margin-top: 18px;">Logs (tail)</h3>
   <pre id="logs">Loading…</pre>
@@ -236,6 +366,7 @@ setInterval(refresh, 2000);
         return "\n".join(logbuf)
 
     return app
+
 
 
 # ------------------------- sensor + control loop -------------------------
@@ -450,6 +581,7 @@ async def main_async():
     logger.addHandler(dh)
 
     state = RuntimeState()
+    start_camera_thread(state, logger)
 
     # web server config
     web_host = _env_str("WEB_HOST", "0.0.0.0")
@@ -478,6 +610,13 @@ async def main_async():
             if exc:
                 raise exc
     finally:
+        # stop camera thread
+        try:
+            if hasattr(state, "_cam_stop_evt"):
+                state._cam_stop_evt.set()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
         # try to stop uvicorn cleanly
         server.should_exit = True
         for t in (sensor_task, web_task):
